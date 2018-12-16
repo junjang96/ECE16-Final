@@ -1,12 +1,36 @@
 # ECE 16 Fall 2018 Final Project Code
 # Jun Young Jang (A12298630)
-# Taylor Hua (AXXXXXXXX)
+# Taylor Hua (A12907514)
+
+
+# ========================================
+# FOR FIREBASE PURPOSES ONLY
+# Place this code at the top of your file
+
+import pyrebase
+import time
+
+config = {
+  "apiKey": "AIzaSyBCuJvm-DPjvS6P9TQ-sXhs01g76e9aWto",
+  "authDomain": "ece16-fall18.firebaseapp.com",
+  "databaseURL": "https://ece16-fall18.firebaseio.com",
+  "storageBucket": "ece16-fall18.appspot.com",
+}
+
+firebase = pyrebase.initialize_app(config)
+db = firebase.database()
+
+last_time = time.time()
+
+# =========================================
+
 
 #                               Libraries
 import scipy.signal as sig
 import serial
 import sys
 import requests
+import math
 from time import sleep
 from matplotlib import pyplot as plt
 from matplotlib import animation
@@ -45,11 +69,25 @@ filter_coeffs = np.zeros((4, filter_order + 1))
 irSignal = np.ndarray((2,N))
 
 #                               Methods
+# Call this function whenever you want to write to the db. Note that there is a maximum of 2 writes per second
+def write_to_pyrebase(teamID, hr, steps):
+    assert isinstance(teamID, str)
+    assert isinstance(hr, int)
+    assert isinstance(steps, int)
+    
+    global last_time
+    current_time = time.time()
+    if (current_time - last_time >= 0.5):
+        last_time = current_time
+        data = {"teamID": teamID, "hr": hr, "steps": steps, "timestamp": current_time}
+        db.child("readings").push(data)
+# Reads input buffer from BLE
 def read_BLE (ser):
     msg = ""
     if (ser.in_waiting > 0):
         msg = ser.readline(ser.in_waiting).decode('utf-8')
     return msg
+# Initializes settings on BLE for central
 def initialize_BLE (ser):
     print("Initializing BLE...")
     ser.reset_input_buffer()
@@ -94,6 +132,7 @@ def initialize_BLE (ser):
     sleep(0.5)
     print("> RESET: " + read_BLE(ser))
     sleep(2)
+# Attempts to establish connection to peripheral HM-10
 def connect_BLE (ser):
     global connection_secure
     ser.write(set_connect.encode())
@@ -110,6 +149,7 @@ def connect_BLE (ser):
         print("Connection Successful")
         connection_secure = True
         ble_in = ""
+# Attempts to reconnect to HM-10 in the case of failed connection
 def reconnect_BLE (ser):
     global connection_secure
     ser.reset_input_buffer()
@@ -130,6 +170,7 @@ def reconnect_BLE (ser):
             connection_secure = True
     if (command == "QUIT" or command == "quit"):
         sys.exit(0)
+# Applies a Band-pass filter on data signal
 def filterSignal(data, filter_coeffs, filter_ICs):
     global first
     # ==================== Step 1 ====================
@@ -150,6 +191,7 @@ def filterSignal(data, filter_coeffs, filter_ICs):
         filter_ICs[0, :] = zi_new_HPF[:]
 
     return proc_data, filter_ICs
+# Calculates the HR given the input data signal
 def calculate_hr(ecg_signal):
     
     # Variable to contain the heartbeat locations
@@ -175,6 +217,7 @@ def calculate_hr(ecg_signal):
     HR = np.mean(hr_at_hb)
     print("HR: ", HR)
     return HR, beat_loc * np.max(ecg_signal[1, :])
+# Function to grab data samples from Arduino
 def grab_samples(n_samples) :
     global sample_count, filter_coeffs, filter_ICs, first
 
@@ -207,6 +250,7 @@ def grab_samples(n_samples) :
     print("Done Grabbing Samples!")
     sample_count += n_samples           # Increment sample_count by amount of n_samples
     return times, ay_values, ay_flt, ir_values            # Return two arrays (size n_sample) with new values
+# Function to update data samples and other parameters (HR, stepCount, etc.)
 def update_plots(ser):
     global times, ay_values, ir_values, locations
     global ay_flt, filter_coeffs, filter_ICs, loc
@@ -228,15 +272,19 @@ def update_plots(ser):
     # calculate hr and locations
     print(avg_heartrate)
     heartrate, locations = calculate_hr(irSignal)
-    heartrate_str = str(int(heartrate))
+    if (math.isnan(heartrate) is True):
+        heartrate_str = str(int(avg_heartrate))
+    else:
+        heartrate_str = str(int(heartrate))
+    # If avg_heartrate has been reset, store new HR value into avg_heartrate
     if avg_heartrate == 0:
         avg_heartrate = heartrate
-    # send heartrate to Arduino via Serial
+    # If spike in HR is detected, send the '*' char to Arduino and reset avg_heartrate
     if heartrate >= (avg_heartrate + HRthresh):
         print("SPIKE DETECTED")
         ser.write(b'*')
         avg_heartrate = 0
-    
+    # send heartrate to Arduino via BLE
     ser.write(b'$')
     ser.write(heartrate_str.encode())
     ser.write(b'>')
@@ -250,7 +298,12 @@ def update_plots(ser):
         loc[N-NS+i] = ay_flt[N-NS+i]
         step = step + 1
         ser.write(b'#')
-    print(step)
+    
+    if (math.isnan(heartrate) is True):
+        write_to_pyrebase('SoggyPasta', int(avg_heartrate), step)
+    else:
+        heartrate_str = str(int(heartrate))
+        write_to_pyrebase('SoggyPasta', int(heartrate), step)
     
 if (__name__ == "__main__"):
     with serial.Serial(port = BLE_port, baudrate = 9600, timeout = 1) as ser:
@@ -275,11 +328,12 @@ if (__name__ == "__main__"):
             filter_ICs[1, :] = sig.lfilter_zi( filter_coeffs[3, :], filter_coeffs[2, :] )
             filter_ICs[0, :] = sig.lfilter_zi( filter_coeffs[1, :], filter_coeffs[0, :] )
 
-            
+            # Apply initial filter
             first = True
             times, ay_values, ay_flt, ir_values = grab_samples(N)
             first = False
             peaks, props = sig.find_peaks(ay_flt, height=500, distance=10, width=(None,10))
+            # For each step detected, send a '#' code to Arduino side
             for i in peaks:
                 loc[i] = ay_flt[i]
                 step = step + 1
@@ -296,8 +350,11 @@ if (__name__ == "__main__"):
             ser.write(heartrate_str.encode())
             ser.write(b'>')
 
+            # Send initial readings to pyrebase
+            write_to_pyrebase('SoggyPasta', int(heartrate), step)
             print("Done Initializing")
             while (connection_secure == True):
+                # Forever call the following method:
                 update_plots(ser)
         finally:
             ser.flush()
